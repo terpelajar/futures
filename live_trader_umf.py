@@ -1,136 +1,199 @@
 # live_trader_umf.py
 from __future__ import annotations
-import time, math, yaml, traceback
+
+import time, math, yaml, asyncio
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
-import numpy as np
-from binance.um_futures import UMFutures
 from telegram import Bot
+from binance.um_futures import UMFutures
 
-from strategies import generate_signals, _atr  # pakai file kamu
+from strategies import generate_signals, _atr
+from universe import build_universe
+from decimal import Decimal, ROUND_DOWN, getcontext
+getcontext().prec = 28  # aman untuk angka besar/kecil
 
-# ======================
-# Utils & helpers
-# ======================
-def now_utc_str():
-    return datetime.now(timezone.utc).strftime('%H:%M:%S')
+# ---------- utils ----------
+def now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
 
 def log(level: str, msg: str):
-    print(f"[{now_utc_str()}] {level:<6} | {msg}", flush=True)
+    print(f"[{now_str()}] {level:<6} | {msg}", flush=True)
 
-def sfloat(x, d=0.0):
-    try: return float(x)
-    except Exception: return float(d)
 
-def sint(x, d=0):
-    try: return int(x)
-    except Exception: return int(d)
+def sfloat(x, d=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(d)
 
-def norm_sym(sym: str) -> str:
-    # "BTC/USDT" -> "BTCUSDT"
-    return sym.replace("/", "").upper().strip()
 
-def denorm_sym(sym: str) -> str:
-    # "BTCUSDT" -> "BTC/USDT"
-    return f"{sym[:-4]}/{sym[-4:]}" if sym.endswith("USDT") else sym
+def sint(x, d=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(d)
+
 
 def last_valid_float(series: pd.Series, lookback: int = 5) -> float | None:
     s = pd.to_numeric(series.tail(lookback), errors="coerce").dropna()
     return float(s.iloc[-1]) if not s.empty else None
 
-# ======================
-# Market data
-# ======================
-def fetch_klines_df(client: UMFutures, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
-    # symbol "BTCUSDT", interval "15m"
-    ks = client.klines(symbol=symbol, interval=interval, limit=int(limit), recvWindow=5000)
-    # kline fields: [openTime, o, h, l, c, v, closeTime, q, numTrades, takerBase, takerQuote, ignore]
-    cols = ['open_time','open','high','low','close','volume','close_time','q','n','tb','tq','i']
-    df = pd.DataFrame(ks, columns=cols)
-    for c in ['open','high','low','close','volume']:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df['timestamp'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
-    df = df.set_index('timestamp')[['open','high','low','close','volume']].dropna()
-    return df
 
-def fetch_mark_price(client: UMFutures, symbol: str) -> float | None:
+def norm_symbol(s: str) -> str:
+    # "BTC/USDT" or "BTC-USDT" -> "BTCUSDT"
+    return s.replace("/", "").replace("-", "").upper()
+
+
+# ---------- telegram helper (handle async Bot) ----------
+def tg_send(bot: Bot, chat_id: int, text: str):
+    """Safe sender for python-telegram-bot v20+ coroutines from sync code."""
     try:
-        mp = client.mark_price(symbol=symbol)  # {'symbol':'BTCUSDT','markPrice':'...'}
-        return sfloat(mp.get('markPrice'), None)
-    except Exception:
-        return None
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(bot.send_message(chat_id=chat_id, text=text))
+    else:
+        loop.create_task(bot.send_message(chat_id=chat_id, text=text))
 
-# ======================
-# Exchange info / filters
-# ======================
+
+# ---------- exchange ----------
+def make_client(cfg: dict) -> UMFutures:
+    live = cfg.get("live", {}) or {}
+    keys = (cfg.get("keys", {}) or {}).get("binance", {})  # keys.binance
+    api, sec = keys.get("api_key", ""), keys.get("secret", "")
+    testnet = bool(live.get("testnet", True))
+    base_url = "https://testnet.binancefuture.com" if testnet else "https://fapi.binance.com"
+    # sync client
+    return UMFutures(key=api, secret=sec, base_url=base_url)
+
+
+# ---------- market metadata ----------
 def load_exchange_info(client: UMFutures) -> dict:
-    ei = client.exchange_info()  # futures exchangeInfo
-    symbols = ei.get('symbols', [])
-    by_symbol = {s['symbol']: s for s in symbols}
-    return by_symbol
+    return client.exchange_info()
 
-def filter_usdtm_symbols(watch: list[str], exinfo: dict) -> tuple[list[str], list[tuple[str,str]]]:
+
+def filter_usdtm_symbols(exch_info: dict, wanted: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    want = [norm_symbol(s) for s in wanted]
     ok, dropped = [], []
-    for raw in watch:
-        s = norm_sym(raw)
-        m = exinfo.get(s)
+    by_symbol = {s["symbol"]: s for s in exch_info.get("symbols", [])}
+    for w in want:
+        m = by_symbol.get(w)
         if not m:
-            dropped.append((raw, "not listed")); continue
-        # futures perpetual, quote=USDT, trading
-        if m.get('contractType') != 'PERPETUAL':
-            dropped.append((raw, "not PERPETUAL")); continue
-        if m.get('quoteAsset') != 'USDT':
-            dropped.append((raw, "quote!=USDT")); continue
-        if m.get('status') != 'TRADING':
-            dropped.append((raw, "status!=TRADING")); continue
-        ok.append(s)  # pakai format tanpa slash
+            dropped.append((w, "not listed"))
+            continue
+        # Syarat: futures & quote USDT; prefer PERPETUAL
+        if m.get("status") != "TRADING":
+            dropped.append((w, "status!=TRADING"))
+            continue
+        if m.get("quoteAsset") != "USDT":
+            dropped.append((w, "quote!=USDT"))
+            continue
+        if m.get("contractType") not in ("PERPETUAL",):  # fokus UM perpetual
+            dropped.append((w, "not PERPETUAL"))
+            continue
+        ok.append(w)
     return ok, dropped
 
-def get_step_minqty_from_filters(exinfo: dict, symbol: str) -> tuple[float|None, float|None]:
-    """Ambil LOT_SIZE.stepSize dan minQty untuk pembulatan kuantitas."""
-    f = exinfo.get(symbol, {}).get('filters', [])
-    step, minqty = None, None
-    for flt in f:
-        if flt.get('filterType') in ('LOT_SIZE', 'MARKET_LOT_SIZE'):
-            step = sfloat(flt.get('stepSize'), None)
-            mq = sfloat(flt.get('minQty'), None)
-            if step is not None: 
-                # pilih yang paling ketat
-                minqty = mq if (minqty is None or (mq is not None and mq > minqty)) else minqty
-    return step, minqty
 
-def quantize_qty(symbol: str, qty: float, price: float, exinfo: dict) -> float:
-    step, minqty = get_step_minqty_from_filters(exinfo, symbol)
-    if qty <= 0:
-        return 0.0
-    q = float(qty)
+def lot_step(symbol_info: dict) -> tuple[float | None, float | None]:
+    step = None
+    min_qty = None
+    for f in symbol_info.get("filters", []):
+        if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+            step = sfloat(f.get("stepSize"), None)
+            min_qty = sfloat(f.get("minQty"), None)
+    return step, min_qty
+
+
+def quantize_qty(sym: str, qty: float, exch_info: dict) -> float:
+    info = next((s for s in exch_info.get("symbols", []) if s.get("symbol") == sym), None)
+    if not info:  # fallback 6 desimal
+        return math.floor(qty * 1e6) / 1e6
+    step, min_qty = lot_step(info)
     if step and step > 0:
-        q = math.floor(q / step) * step
-    if minqty and q < minqty:
-        q = 0.0
-    return float(q)
+        qty = math.floor(qty / step) * step
+    if min_qty and qty < min_qty:
+        qty = 0.0
+    return float(qty)
+    
+# ======== PRECISION HELPERS (tambahkan setelah quantize_qty) ========
+def _dec(x) -> Decimal:
+    return Decimal(str(x))
 
-# ======================
-# Risk / sizing / levels
-# ======================
-def qty_from_risk(entry: float, sl: float, equity_usdt: float, rpt: float) -> tuple[float, float]:
+def _step_decimals(step) -> int:
+    s = str(step)
+    return len(s.split(".")[1].rstrip("0")) if "." in s else 0
+
+def _symbol_info(exch_info: dict, sym: str) -> dict | None:
+    return next((s for s in exch_info.get("symbols", []) if s.get("symbol") == sym), None)
+
+def _tick_size(info: dict) -> float | None:
+    for f in info.get("filters", []):
+        if f.get("filterType") == "PRICE_FILTER":
+            ts = f.get("tickSize")
+            return float(ts) if ts is not None else None
+    return None
+
+def _qty_step(info: dict) -> float | None:
+    # MARKET order → prefer MARKET_LOT_SIZE; fallback LOT_SIZE
+    mls = None
+    ls  = None
+    for f in info.get("filters", []):
+        if f.get("filterType") == "MARKET_LOT_SIZE":
+            mls = f.get("stepSize")
+        elif f.get("filterType") == "LOT_SIZE":
+            ls = f.get("stepSize")
+    step = mls if mls is not None else ls
+    return float(step) if step is not None else None
+
+def quantize_price_str(sym: str, price: float, exch_info: dict) -> str:
+    """Bulatkan harga ke tickSize dan format string dengan jumlah desimal yang benar."""
+    info = _symbol_info(exch_info, sym)
+    if not info:
+        return f"{price:.6f}"
+    tick = _tick_size(info) or 0.01
+    d = _step_decimals(tick)
+    step_d = _dec(tick)
+    q = (_dec(price) / step_d).to_integral_value(rounding=ROUND_DOWN) * step_d
+    return f"{q:.{d}f}"
+
+def quantize_qty_str(sym: str, qty: float, exch_info: dict) -> str:
+    """Bulatkan qty ke stepSize dan format string dengan jumlah desimal yang benar."""
+    info = _symbol_info(exch_info, sym)
+    if not info:
+        q = (_dec(qty) * _dec("1e6")).to_integral_value(rounding=ROUND_DOWN) / _dec("1e6")
+        return f"{q:.6f}"
+    step = _qty_step(info) or 0.000001
+    d = _step_decimals(step)
+    step_d = _dec(step)
+    q = (_dec(qty) / step_d).to_integral_value(rounding=ROUND_DOWN) * step_d
+    return f"{q:.{d}f}"
+# ================================================================
+
+
+
+# ---------- sizing ----------
+def qty_from_risk(entry: float, sl: float, equity_usdt: float, risk_per_trade: float) -> tuple[float, float]:
     stop_abs = abs(entry - sl)
-    risk_amount = equity_usdt * rpt
-    if stop_abs <= 0 or risk_amount <= 0: 
+    risk_amount = equity_usdt * risk_per_trade
+    if stop_abs <= 0 or risk_amount <= 0:
         return 0.0, 0.0
     return risk_amount / stop_abs, risk_amount
 
+
 def compute_levels(df: pd.DataFrame, side: int, params: dict, risk: dict, entry_source: str = "close"):
-    price = df['open'] if entry_source == "open" else df['close']
+    price = df["open"] if entry_source == "open" else df["close"]
     entry = last_valid_float(price, 5)
     if entry is None:
         raise ValueError("no valid entry")
-    rr = sfloat(risk.get('take_profit_rr', 2.0), 2.0)
-    stop_mode = (risk.get('stop_mode') or 'atr').lower()
-    if stop_mode == 'atr':
-        ap = sint(params.get('atr_entry_period', 14), 14)
-        am = sfloat(params.get('atr_entry_mult', 1.5), 1.5)
+
+    rr = sfloat(risk.get("take_profit_rr", 2.0), 2.0)
+    stop_mode = (risk.get("stop_mode") or "atr").lower()
+
+    if stop_mode == "atr":
+        ap = sint(params.get("atr_entry_period", 14), 14)
+        am = sfloat(params.get("atr_entry_mult", 1.5), 1.5)
         atr = last_valid_float(_atr(df, ap), 5)
         if not atr or atr <= 0:
             raise ValueError("ATR unavailable")
@@ -141,436 +204,420 @@ def compute_levels(df: pd.DataFrame, side: int, params: dict, risk: dict, entry_
             sl = entry + am * atr
             tp = entry - rr * (sl - entry)
     else:
-        slp = sfloat(risk.get('stop_loss_pct', 0.02), 0.02)
-        tpp = risk.get('take_profit_pct')
+        slp = sfloat(risk.get("stop_loss_pct", 0.02), 0.02)
+        tpp = risk.get("take_profit_pct")
         tpp = sfloat(tpp if tpp is not None else rr * slp, rr * slp)
         sl = entry * (1 - slp) if side > 0 else entry * (1 + slp)
         tp = entry * (1 + tpp) if side > 0 else entry * (1 - tpp)
+
+    # minimal SL (opsional)
+    min_sl = sfloat(risk.get("min_sl_pct", 0.0), 0.0)
+    if min_sl > 0.0:
+        cur_frac = abs((sl / entry - 1.0)) if side > 0 else abs((1.0 - sl / entry))
+        if cur_frac < min_sl:
+            if side > 0:
+                sl = entry * (1 - min_sl)
+                tp = entry + rr * (entry - sl)
+            else:
+                sl = entry * (1 + min_sl)
+                tp = entry - rr * (sl - entry)
+
     return float(entry), float(sl), float(tp)
 
-# ----- live margin/bracket clamps -----
+
+# ---------- account helpers ----------
 def futures_free_usdt(client: UMFutures) -> float:
-    """availableBalance USDT di wallet futures."""
+    # /fapi/v2/balance
     try:
-        bal = client.balance(recvWindow=5000)  # list of assets
-        for a in bal:
-            if a.get('asset') == 'USDT':
-                return sfloat(a.get('availableBalance'), 0.0)
+        data = client.balance()
+        # list of dict: [{'asset':'USDT', 'availableBalance':'...'}, ...]
+        for a in data:
+            if a.get("asset") == "USDT":
+                free = a.get("availableBalance") or a.get("balance") or "0"
+                return max(float(free), 0.0)
     except Exception as e:
         log("WARN", f"balance: {e}")
     return 0.0
 
-def get_notional_cap(client: UMFutures, symbol: str, leverage: int) -> float:
-    """
-    Ambil notionalCap terbesar yang masih valid untuk leverage yang diajukan.
-    """
+
+def leverage_bracket_cap(client: UMFutures, symbol: str, leverage: int) -> float:
+    """Ambil notionalCap yang cocok untuk leverage. Kompatibel beberapa versi client."""
     try:
-        data = client.leverage_bracket(symbol=symbol, recvWindow=5000)
-        # response bisa list, ambil item 0
-        item = data[0] if isinstance(data, list) and data else data
-        brackets = item.get('brackets', [])
+        # Prefer API modern: leverage_brackets (jamak)
+        if hasattr(client, "leverage_brackets"):
+            data = client.leverage_brackets(symbol=symbol)
+        else:
+            # Fallback: beberapa versi expose singular
+            data = client.leverage_bracket(symbol=symbol)
+
+        if isinstance(data, dict):
+            brackets = data.get("brackets", [])
+        elif isinstance(data, list):
+            item = next((it for it in data if it.get("symbol") == symbol), data[0] if data else {})
+            brackets = item.get("brackets", [])
+        else:
+            brackets = []
+
         caps_ok, caps_all = [], []
         for b in brackets:
-            ilv = sint(b.get('initialLeverage'), 0)
-            cap = sfloat(b.get('notionalCap'), 0.0)
+            ilv = int(b.get("initialLeverage") or 0)
+            cap = float(b.get("notionalCap") or 0.0)
             caps_all.append(cap)
-            if ilv >= leverage:
+            if ilv >= int(leverage):
                 caps_ok.append(cap)
+
         if caps_ok:
             return max(caps_ok)
         if caps_all:
             return min(caps_all)
-        return float('inf')
+        return float("inf")
     except Exception as e:
         log("WARN", f"leverage_bracket {symbol}: {e}")
-        return float('inf')
+        return float("inf")
 
-def clamp_qty_by_free_and_bracket(client: UMFutures, exinfo: dict, symbol: str,
-                                  qty_init: float, entry: float, lev: int,
-                                  margin_safety=0.95, bracket_safety=0.98) -> tuple[float, dict]:
+
+def clamp_by_free_and_bracket(
+    client: UMFutures,
+    exch_info: dict,
+    symbol: str,
+    qty_init: float,
+    entry: float,
+    leverage: int,
+    margin_safety: float = 0.95,
+    bracket_safety: float = 0.98,
+) -> tuple[float, dict]:
     info = {}
-    notional_init = float(qty_init) * float(entry)
+    notional_init = qty_init * entry
     free = futures_free_usdt(client)
-    cap  = get_notional_cap(client, symbol, lev)
-    allowed_free_notional = free * lev * margin_safety
-    allowed_bracket_notional = (cap * bracket_safety) if cap != float('inf') else float('inf')
+    cap = leverage_bracket_cap(client, symbol, leverage)
+
+    allowed_free_notional = free * leverage * margin_safety
+    allowed_bracket_notional = (cap * bracket_safety) if cap != float("inf") else float("inf")
     allowed_notional = min(notional_init, allowed_free_notional, allowed_bracket_notional)
-    info.update(dict(
-        free_usdt=free,
-        cap_notional=cap,
-        notional_init=notional_init,
-        allowed_free_notional=allowed_free_notional,
-        allowed_bracket_notional=allowed_bracket_notional,
-        allowed_notional=allowed_notional,
-    ))
+
+    info.update(
+        dict(
+            free_usdt=free,
+            cap_notional=cap,
+            notional_init=notional_init,
+            allowed_free_notional=allowed_free_notional,
+            allowed_bracket_notional=allowed_bracket_notional,
+            allowed_notional=allowed_notional,
+        )
+    )
+
     if allowed_notional <= 0:
         return 0.0, info
+
     qty_target = allowed_notional / max(entry, 1e-12)
-    qty_final = quantize_qty(symbol, qty_target, entry, exinfo)
+    qty_final = quantize_qty(symbol, qty_target, exch_info)
     return float(qty_final), info
 
-# ======================
-# Account/futures settings
-# ======================
-def ensure_settings(client: UMFutures, symbol: str, leverage: int, margin_type: str, position_mode: str):
-    # position side (dual or oneway)
+
+# ---------- futures account settings ----------
+def ensure_settings(client: UMFutures, exch_info: dict, symbol: str, leverage: int, margin_type: str, position_mode: str):
+    # position mode
     try:
-        dual = 'true' if position_mode.lower() == 'hedge' else 'false'
-        client.change_position_mode(dualSidePosition=dual, recvWindow=5000)
+        dual = (position_mode or "").lower() == "hedge"
+        client.change_position_mode(dualSidePosition="true" if dual else "false")
     except Exception:
         pass
-    # margin type
+    # margin type & leverage
     try:
-        client.change_margin_type(symbol=symbol, marginType=margin_type.upper(), recvWindow=5000)
+        client.change_margin_type(symbol=symbol, marginType=margin_type.upper())
     except Exception:
         pass
-    # leverage
     try:
-        client.change_leverage(symbol=symbol, leverage=int(leverage), recvWindow=5000)
+        client.change_leverage(symbol=symbol, leverage=int(leverage))
     except Exception:
         pass
 
-# ======================
-# Orders
-# ======================
+
+# ---------- orders ----------
 def cancel_all_open_orders(client: UMFutures, symbol: str):
     try:
-        client.cancel_open_orders(symbol=symbol, recvWindow=5000)
+        client.cancel_open_orders(symbol=symbol)
     except Exception as e:
-        log("WARN", f"cancel_open_orders {denorm_sym(symbol)}: {e}")
+        log("WARN", f"cancel_open_orders {symbol}: {e}")
 
-def place_market_order(client: UMFutures, symbol: str, side: int, qty: float, position_mode: str):
-    side_txt = 'BUY' if side > 0 else 'SELL'
-    params = dict(recvWindow=5000)
-    if position_mode.lower() == 'hedge':
-        params['positionSide'] = 'LONG' if side > 0 else 'SHORT'
-    return client.new_order(symbol=symbol, side=side_txt, type='MARKET', quantity=qty, **params)
 
-def place_sl_tp(client: UMFutures, symbol: str, side: int, sl: float, tp: float, working_type: str, position_mode: str):
-    base = dict(recvWindow=5000, workingType=working_type, reduceOnly='true', closePosition='true', timeInForce='GTC')
-    if position_mode.lower() == 'hedge':
-        base_long  = {**base, 'positionSide': 'LONG'}
-        base_short = {**base, 'positionSide': 'SHORT'}
-        sl_params = base_long if side > 0 else base_short
-        tp_params = base_long if side > 0 else base_short
-    else:
-        sl_params = dict(base)
-        tp_params = dict(base)
-
-    sl_side = 'SELL' if side > 0 else 'BUY'
-    tp_side = 'SELL' if side > 0 else 'BUY'
-
-    # SL
-    try:
-        client.new_order(symbol=symbol, side=sl_side, type='STOP_MARKET', stopPrice=sl, quantity=None, **sl_params)
-    except Exception as e:
-        log("ERROR", f"place SL {denorm_sym(symbol)}: {e}")
-    # TP
-    try:
-        client.new_order(symbol=symbol, side=tp_side, type='TAKE_PROFIT_MARKET', stopPrice=tp, quantity=None, **tp_params)
-    except Exception as e:
-        log("ERROR", f"place TP {denorm_sym(symbol)}: {e}")
-
-def get_open_orders(client: UMFutures, symbol: str):
-    try:
-        return client.get_open_orders(symbol=symbol, recvWindow=5000)
-    except Exception:
-        return []
-
-def cancel_only_sl(client: UMFutures, symbol: str):
-    """Batalkan hanya STOP/STOP_MARKET closePosition reduceOnly."""
-    try:
-        orders = get_open_orders(client, symbol)
-        for od in orders:
-            t = od.get('type', '')
-            cp = str(od.get('closePosition', '')).lower() in ('true','True','1')
-            ro = str(od.get('reduceOnly', '')).lower() in ('true','True','1')
-            if t in ('STOP', 'STOP_MARKET') and (cp or ro):
-                client.cancel_order(symbol=symbol, orderId=od.get('orderId'), recvWindow=5000)
-    except Exception as e:
-        log("WARN", f"cancel_only_sl {denorm_sym(symbol)}: {e}")
-
-# ======================
-# Breakeven @ +1R
-# ======================
-def maybe_move_to_breakeven(client: UMFutures, symbol: str, side: int, entry: float, sl: float,
-                            be_cfg: dict, working_type: str, position_mode: str):
+def place_protective_orders(client: UMFutures, symbol: str, side: int, sl: float, tp: float,
+                            working_type: str, position_mode: str, exch_info: dict):
     """
-    Jika harga sudah ≥ entry + 1R (long) atau ≤ entry - 1R (short),
-    geser SL ke BE + fee/slip buffer.
+    Pasang SL/TP close-all:
+      - type: STOP_MARKET / TAKE_PROFIT_MARKET
+      - gunakan closePosition=True
+      - JANGAN kirim reduceOnly atau quantity (akan error -1106).
     """
-    if not be_cfg or not be_cfg.get('enabled', True):
-        return
+    base = dict(timeInForce="GTC", workingType=working_type, closePosition=True)
+    if (position_mode or "").lower() == "hedge":
+        base["positionSide"] = "LONG" if side > 0 else "SHORT"
 
-    r_multiple = sfloat(be_cfg.get('r_multiple', 1.0), 1.0)
-    fee_taker_pct = sfloat(be_cfg.get('fee_taker_pct', 0.0005), 0.0005)
-    slip_pct = sfloat(be_cfg.get('slippage_est_pct', 0.0002), 0.0002)
-    extra = sfloat(be_cfg.get('extra_buffer_pct', 0.0001), 0.0001)
+    # DEFINISIKAN sisi order untuk SL/TP
+    sl_side = "SELL" if side > 0 else "BUY"
+    tp_side = "SELL" if side > 0 else "BUY"
 
-    # total buffer "per sisi" (open + close + slip2x + extra)
-    total = (fee_taker_pct * 2.0) + (slip_pct * 2.0) + extra
+    # Quantize harga ke tickSize
+    sl_s = quantize_price_str(symbol, sl, exch_info)
+    tp_s = quantize_price_str(symbol, tp, exch_info)
 
-    # 1R:
-    R = abs(entry - sl)
-
-    # Harga acuan -> mark price
-    mp = fetch_mark_price(client, symbol)
-    if mp is None:
-        return
-
-    hit = False
-    if side > 0:
-        # long: profit >= r_multiple * R ?
-        if (mp - entry) >= (r_multiple * R):
-            new_sl = entry * (1.0 + total)
-            hit = True
-    else:
-        if (entry - mp) >= (r_multiple * R):
-            new_sl = entry * (1.0 - total)
-            hit = True
-
-    if not hit:
-        return
-
-    # Geser SL: batalkan SL lama saja, lalu pasang STOP_MARKET baru
     try:
-        cancel_only_sl(client, symbol)
-        # pasang SL baru @BE+fee
-        base = dict(recvWindow=5000, workingType=working_type, reduceOnly='true', closePosition='true', timeInForce='GTC')
-        if position_mode.lower() == 'hedge':
-            base['positionSide'] = 'LONG' if side > 0 else 'SHORT'
-        sl_side = 'SELL' if side > 0 else 'BUY'
-        client.new_order(symbol=symbol, side=sl_side, type='STOP_MARKET', stopPrice=new_sl, quantity=None, **base)
-        log("MOVE", f"{denorm_sym(symbol)} -> BE SL @ {new_sl:.6f}")
+        client.new_order(symbol=symbol, side=sl_side, type="STOP_MARKET", stopPrice=sl_s, **base)
     except Exception as e:
-        log("WARN", f"move_to_BE {denorm_sym(symbol)}: {e}")
+        log("ERROR", f"place SL {symbol}: {e}")
+    try:
+        client.new_order(symbol=symbol, side=tp_side, type="TAKE_PROFIT_MARKET", stopPrice=tp_s, **base)
+    except Exception as e:
+        log("ERROR", f"place TP {symbol}: {e}")
 
-# ======================
-# Snapshot helper
-# ======================
-def send_snapshot(bot: Bot, chat_ids, client: UMFutures, symbols: list[str], tf: str, lookback: int,
-                  default_strategy: str, strat_map: dict, base_params: dict, params_over: dict, risk: dict):
+
+
+# ---------- klines ----------
+def fetch_df(client: UMFutures, symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    # kline format: [openTime, open, high, low, close, volume, closeTime, ...]
+    raw = client.klines(symbol=symbol, interval=interval, limit=limit)
+    if not raw:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    cols = ["openTime", "open", "high", "low", "close", "volume", "closeTime", "q", "n", "tbb", "tbq", "ig"]
+    df = pd.DataFrame(raw, columns=cols[: len(raw[0])])
+    df["timestamp"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.set_index("timestamp")[["open", "high", "low", "close", "volume"]].dropna()
+
+
+# ---------- one-shot snapshot ----------
+def send_snapshot(
+    bot: Bot,
+    chat_ids,
+    client: UMFutures,
+    symbols: list[str],
+    tf: str,
+    lookback: int,
+    default_strategy: str,
+    strategy_map: dict,
+    base_params: dict,
+    params_over: dict,
+    risk: dict,
+    exch_info: dict,
+):
     lines = []
-    for s in symbols:
+    for sym in symbols:
         try:
-            df = fetch_klines_df(client, s, tf, lookback)
+            df = fetch_df(client, sym, tf, min(lookback, 1000))
             if len(df) < 60:
-                lines.append(f"{denorm_sym(s)}: data<60 bars")
+                lines.append(f"{sym}: data<60 bars")
                 continue
-            strat = strat_map.get(denorm_sym(s), default_strategy)
-            params = dict(base_params); params.update(params_over.get(denorm_sym(s), {}))
+            strat = strategy_map.get(sym, default_strategy)
+            params = dict(base_params)
+            params.update(params_over.get(sym, {}))
             sig_df = generate_signals(df, strat, params)
-            sig = int(sig_df['signal'].iloc[-1])
-            entry, sl, tp = compute_levels(df, (sig if sig != 0 else 1), params, risk, entry_source=str(risk.get('entry_source','close')))
-            if sig > 0: tp_pct = (tp/entry - 1.0) * 100.0
-            elif sig < 0: tp_pct = (1.0 - tp/entry) * 100.0
-            else: tp_pct = 0.0
-            lines.append(f"{denorm_sym(s)}: sig={sig}  TP≈{abs(tp_pct):.2f}%")
+            sig = int(sig_df["signal"].iloc[-1])
+            entry, sl, tp = compute_levels(df, sig if sig != 0 else 1, params, risk, entry_source=str(risk.get("entry_source", "close")))
+            tp_pct = (tp / entry - 1.0) * 100.0 if sig > 0 else (1.0 - tp / entry) * 100.0 if sig < 0 else 0.0
+            lines.append(f"{sym}: sig={sig}  TP≈{abs(tp_pct):.2f}%")
         except Exception as e:
-            lines.append(f"{denorm_sym(s)}: err {str(e)[:60]}")
+            lines.append(f"{sym}: err {str(e)[:60]}")
     msg = "📸 Snapshot (latest signals)\n" + "\n".join(lines[:20])
     for cid in chat_ids:
-        try: bot.send_message(chat_id=cid, text=msg)
-        except Exception: pass
+        try:
+            tg_send(bot, cid, msg)
+        except Exception:
+            pass
 
-# ======================
-# Main
-# ======================
+
+# ---------- main ----------
 def main():
     with open("config.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    exch = (cfg.get('exchange') or 'binance').lower()
-    if exch != 'binance':
+    exch = cfg.get("exchange", "binance")
+    market_type = cfg.get("market_type", "futures")
+    if (exch or "").lower() != "binance" or (market_type or "").lower() not in ("futures", "future"):
         raise RuntimeError("Script ini khusus Binance USDⓈ-M Futures")
 
-    market_type = (cfg.get('market_type') or 'futures').lower()
-    if market_type not in ('futures','future'):
-        raise RuntimeError("Gunakan market_type: futures (USDⓈ-M)")
+    tf = cfg["timeframe"]
+    lookback = sint(cfg.get("lookback_candles", 300), 300)
 
-    tf = cfg['timeframe']
-    lookback = sint(cfg.get('lookback_candles', 300), 300)
-
-    # universe (boleh "ETH/USDT" dsb)
-    syms_cfg = (cfg.get('universe', {}) or {}).get('symbols', []) or cfg.get('symbols', [])
-    if not syms_cfg:
-        raise RuntimeError("No symbols in config.yaml")
-    symbols_raw = syms_cfg[:]  # keep original for map keys
-    symbols = [norm_sym(s) for s in syms_cfg]
+    # universe input bisa "BTC/USDT" dst → normalkan ke "BTCUSDT"
+    symbols_in = (
+        build_universe(cfg)
+        if cfg.get("universe", {}).get("mode") == "dynamic"
+        else (cfg.get("universe", {}).get("symbols", []) or cfg.get("symbols", []))
+    )
+    if not symbols_in:
+        raise RuntimeError("No symbols")
+    symbols_req = [norm_symbol(s) for s in symbols_in]
 
     # telegram
-    tg = cfg['telegram']
-    bot = Bot(token=tg['bot_token'])
-    chat_ids = tg['chat_ids']
+    tg = cfg["telegram"]
+    bot = Bot(token=tg["bot_token"])
+    chat_ids = tg["chat_ids"]
 
-    # risk & live cfg
-    risk = cfg.get('risk', {})
-    leverage = sint(risk.get('leverage', 3), 3)
-    rpt = sfloat(risk.get('risk_per_trade', 0.01), 0.01)
-    max_margin_frac = sfloat(risk.get('max_margin_frac', 0.2), 0.2)  # batas porsi margin pseudo
-    entry_source = str(risk.get('entry_source', 'close'))
-    be_cfg = (risk.get('breakeven') or {})
+    # risk & live
+    risk = cfg.get("risk", {}) or {}
+    leverage = sint(risk.get("leverage", 3), 3)
+    rpt = sfloat(risk.get("risk_per_trade", 0.01), 0.01)
+    max_margin_frac = sfloat(risk.get("max_margin_frac", 0.2), 0.2)  # not used now; keep for future caps
+    entry_source = str(risk.get("entry_source", "close"))
 
-    live = (cfg.get('live') or {})
-    testnet = bool(live.get('testnet', True))
-    position_mode = live.get('position_mode', 'oneway')
-    margin_type   = live.get('margin_type', 'ISOLATED')
-    working_type  = live.get('working_type', 'MARK_PRICE')
-    send_fills    = bool(live.get('send_fills_to_telegram', True))
-    poll_sleep    = sint(live.get('poll_sleep', 10), 10)
-    hb_minutes    = sint(live.get('heartbeat_minutes', 5), 5)
+    live = cfg.get("live", {}) or {}
+    if not live.get("enabled", False):
+        raise RuntimeError("live.enabled must be true")
+    position_mode = live.get("position_mode", "oneway")
+    margin_type = live.get("margin_type", "ISOLATED")
+    working_type = live.get("working_type", "MARK_PRICE")
+    send_fills = bool(live.get("send_fills_to_telegram", True))
+    poll_sleep = sint(live.get("poll_sleep", 10), 10)
+    hb_minutes = sint(live.get("heartbeat_minutes", 0), 0)
 
-    # strategies
-    default_strategy = (cfg.get('strategies') or ['boll_breakout'])[0]
-    strat_map   = cfg.get('strategy_per_symbol', {}) or {}
-    base_params = cfg.get('params', {}) or {}
-    params_over = cfg.get('params_overrides', {}) or {}
+    # strategi
+    default_strategy = (cfg.get("strategies") or ["ema_cross"])[0]
+    strategy_map = cfg.get("strategy_per_symbol", {}) or {}
+    base_params = cfg.get("params", {}) or {}
+    params_over = cfg.get("params_overrides", {}) or {}
 
-    # equity pseudo (cadangan kalau mau batasi porsi margin di atas)
-    equity_usdt = sfloat(cfg.get('account', {}).get('equity_usdt', 1000.0), 1000.0)
+    # equity bayangan (buat sizing awal)
+    equity_usdt = sfloat(cfg.get("account", {}).get("equity_usdt", 1000.0), 1000.0)
 
-    # --- client
-    keys = ((cfg.get('keys') or {}).get('binance') or {})
-    api_key = keys.get('api_key')
-    api_sec = keys.get('secret')
-    if not api_key or not api_sec:
-        raise RuntimeError("API key/secret kosong di config.yaml -> keys.binance")
-
-    base_url = "https://testnet.binancefuture.com" if testnet else None
-    client = UMFutures(key=api_key, secret=api_sec, base_url=base_url) if base_url else UMFutures(key=api_key, secret=api_sec)
-
-    # --- exchangeInfo & filter
-    exinfo = load_exchange_info(client)
-    ok, dropped = filter_usdtm_symbols(symbols, exinfo)
+    client = make_client(cfg)
+    exch_info = load_exchange_info(client)
+    ok, dropped = filter_usdtm_symbols(exch_info, symbols_req)
     if dropped:
-        log("FILTER", "dropped " + ", ".join([d[0] for d in dropped][:20]) + ("..." if len(dropped) > 20 else ""))
+        log("FILTER", f"dropped {len(dropped)}: " + ", ".join([d[0] for d in dropped][:20]) + ("..." if len(dropped) > 20 else ""))
     if not ok:
-        fallback = [s for s in ("BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","ADAUSDT") if s in exinfo]
+        # fallback 5 besar
+        fallback = [
+            s
+            for s in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT"]
+            if any(x.get("symbol") == s for x in exch_info.get("symbols", []))
+        ]
         if not fallback:
             raise RuntimeError("No valid symbols after filter")
         ok = fallback
-        log("FILTER", "using fallback " + ", ".join([denorm_sym(s) for s in ok]))
+        log("FILTER", "using fallback: " + ", ".join(ok))
     symbols = ok
 
-    # --- ensure futures settings per symbol
-    for s in symbols:
-        ensure_settings(client, s, leverage, margin_type, position_mode)
+    # apply account settings per symbol
+    for sym in symbols:
+        ensure_settings(client, exch_info, sym, leverage, margin_type, position_mode)
 
-    # --- startup ping
+    # startup
     start_text = (
-        "🚀 LIVE Trader started\n"
-        f"Exchange: binance (futures {'TESTNET' if testnet else 'MAINNET'})\n"
+        "🚀 LIVE Trader (UMFutures) started\n"
+        f"Exchange: {exch} (futures {'TESTNET' if (live.get('testnet', True)) else 'LIVE'})\n"
         f"TF: {tf}  Symbols: {len(symbols)}  Leverage: {leverage}x  Mode: {position_mode}/{margin_type}\n"
-        f"workingType={working_type}, risk_per_trade={rpt*100:.2f}%"
+        f"workingType={working_type}, risk_per_trade={rpt*100:.2f}%  equity≈{equity_usdt:.2f}"
     )
-    if send_fills:
-        for cid in chat_ids:
-            try: bot.send_message(chat_id=cid, text=start_text)
-            except Exception: pass
-    log("START", start_text.replace("\n"," | "))
+    for cid in chat_ids:
+        try:
+            tg_send(bot, cid, start_text)
+        except Exception:
+            pass
+    log("START", start_text.replace("\n", " | "))
 
     # snapshot sekali
-    send_snapshot(bot, chat_ids, client, symbols, tf, lookback, default_strategy, strat_map, base_params, params_over, risk)
+    send_snapshot(
+        bot,
+        chat_ids,
+        client,
+        symbols,
+        tf,
+        lookback,
+        default_strategy,
+        strategy_map,
+        base_params,
+        params_over,
+        risk,
+        exch_info,
+    )
 
-    # state
     last_ts = {s: None for s in symbols}
-    last_sig = {s: 0 for s in symbols}
-    pos_state = {s: None for s in symbols}  # { 'side':1/-1, 'entry':.., 'sl':.., 'tp':.. }
-    next_hb = datetime.now(timezone.utc) + timedelta(minutes=hb_minutes)
+    last_sig = {s: None for s in symbols}
+    next_hb = datetime.now(timezone.utc)
 
-    # --- loop
-    while True:
-        processed = 0
-        try:
-            for s in symbols:
+    try:
+        while True:
+            processed = 0
+            for sym in symbols:
                 try:
-                    df = fetch_klines_df(client, s, tf, lookback)
+                    df = fetch_df(client, sym, tf, min(lookback, 1000))
                     processed += 1
                     if len(df) < 60:
                         continue
+
                     newest = df.index[-1]
-                    if last_ts[s] is None or newest > last_ts[s]:
-                        last_ts[s] = newest
+                    if last_ts[sym] is None or newest > last_ts[sym]:
+                        last_ts[sym] = newest
 
-                        # generate signal
-                        key = denorm_sym(s)
-                        strat = strat_map.get(key, default_strategy)
-                        params = dict(base_params); params.update(params_over.get(key, {}))
+                        strat = strategy_map.get(sym, default_strategy)
+                        params = dict(base_params)
+                        params.update(params_over.get(sym, {}))
                         sig_df = generate_signals(df, strat, params)
-                        sig = int(sig_df['signal'].iloc[-1])
+                        sig = int(sig_df["signal"].iloc[-1])
 
-                        # BE manager (kalau ada posisi)
-                        st = pos_state.get(s)
-                        if st:
-                            maybe_move_to_breakeven(client, s, st['side'], st['entry'], st['sl'], be_cfg, working_type, position_mode)
-
-                        # Entry hanya ketika berubah arah / dari flat->posisi
-                        if sig != 0 and last_sig.get(s, 0) != sig:
-                            # hitung level & qty risk-based
+                        if sig != 0 and last_sig.get(sym) != sig:
                             entry, sl, tp = compute_levels(df, sig, params, risk, entry_source=entry_source)
 
-                            # sizing risk pseudo-equity (optional batas awal)
-                            qty_risk, _ = qty_from_risk(entry, sl, equity_usdt, rpt)
-                            qty_init = quantize_qty(s, qty_risk, entry, exinfo)
+                            # sizing by risk (pakai equity_usdt config)
+                            qty_raw, _ = qty_from_risk(entry, sl, equity_usdt, rpt)
+                            qty_init = quantize_qty(sym, qty_raw, exch_info)
                             if qty_init <= 0:
-                                last_sig[s] = sig
-                                log("SKIP", f"{denorm_sym(s)} qty<=0 (risk)")
+                                log("SKIP", f"{sym} qty<=0 (risk)")
+                                last_sig[sym] = sig
                                 continue
 
-                            # clamp by real free & bracket
-                            qty, clamp = clamp_qty_by_free_and_bracket(
-                                client, exinfo, s, qty_init, entry, leverage,
-                                margin_safety=0.95, bracket_safety=0.98
+                            # clamp by free & bracket (pakai saldo akun real)
+                            qty, clamp = clamp_by_free_and_bracket(
+                                client,
+                                exch_info,
+                                sym,
+                                qty_init,
+                                entry,
+                                leverage,
+                                margin_safety=0.95,
+                                bracket_safety=0.98,
                             )
                             if qty <= 0:
-                                last_sig[s] = sig
-                                log("SKIP", f"{denorm_sym(s)} qty=0 after clamp | free={clamp.get('free_usdt'):.2f} cap={clamp.get('cap_notional')}")
+                                log("SKIP", f"{sym} qty=0 clamp | free={clamp.get('free_usdt')} cap={clamp.get('cap_notional')}")
+                                last_sig[sym] = sig
                                 continue
 
                             notional = qty * entry
-                            # tambahan: batasi porsi margin semu (opsional)
-                            max_margin = equity_usdt * max_margin_frac
-                            margin_used = notional / max(leverage,1)
-                            if margin_used > max_margin and notional > 0:
-                                scale = max_margin / margin_used
-                                qty = quantize_qty(s, qty * scale, entry, exinfo)
+                            # (opsi tambahan: hard cap notional, jika diperlukan)
+                            max_notional_cap = sfloat(risk.get("max_notional_usdt", 0.0), 0.0)
+                            if max_notional_cap > 0 and notional > max_notional_cap:
+                                scale = max_notional_cap / notional
+                                qty = quantize_qty(sym, qty * scale, exch_info)
                                 notional = qty * entry
-                                margin_used = notional / max(leverage,1)
-                            if qty <= 0:
-                                last_sig[s] = sig
-                                log("SKIP", f"{denorm_sym(s)} qty after max_margin clamp <= 0")
-                                continue
+                                if qty <= 0:
+                                    log("SKIP", f"{sym} qty after cap<=0")
+                                    last_sig[sym] = sig
+                                    continue
 
-                            # cancel semua open-orders lama
-                            cancel_all_open_orders(client, s)
+                            # cancel open orders lama
+                            cancel_all_open_orders(client, sym)
 
-                            # market order
+                            # MARKET entry
+                            side_txt = "BUY" if sig > 0 else "SELL"
+                            entry_params = {}
+                            if (position_mode or "").lower() == "hedge":
+                                entry_params["positionSide"] = "LONG" if sig > 0 else "SHORT"
                             try:
-                                place_market_order(client, s, sig, qty, position_mode)
+                                qty_s = quantize_qty_str(sym, qty, exch_info)
+                                client.new_order(symbol=sym, side=side_txt, type="MARKET", quantity=qty_s, **entry_params)
+
                             except Exception as e:
-                                last_sig[s] = sig
-                                err = f"⚠️ Order gagal\n{denorm_sym(s)} {'LONG' if sig>0 else 'SHORT'}\nQty≈ {qty:.6f}\nErr: {str(e)[:180]}"
-                                log("ERROR", f"order {denorm_sym(s)}: {e}")
-                                if send_fills:
-                                    for cid in chat_ids:
-                                        try: bot.send_message(chat_id=cid, text=err)
-                                        except Exception: pass
-                                # backoff simple utk rate-limit
-                                es = str(e)
-                                if '429' in es or '418' in es or 'Too many requests' in es:
-                                    log("RATE", "Backoff 60s karena rate limit"); time.sleep(60)
+                                log("ERROR", f"order {sym}: {e}")
+                                last_sig[sym] = sig
                                 continue
 
-                            # protective orders
-                            place_sl_tp(client, s, sig, sl, tp, working_type, position_mode)
+                            # SL/TP close-all (tanpa reduceOnly, tanpa quantity)
+                            place_protective_orders(client, sym, sig, sl, tp, working_type, position_mode, exch_info)
 
-                            # simpan state posisi minimal (buat BE)
-                            pos_state[s] = {'side': sig, 'entry': entry, 'sl': sl, 'tp': tp}
-
-                            # notif
-                            side_tag = "🟢 LONG" if sig>0 else "🔴 SHORT"
+                            # Telegram
                             msg = (
-                                f"{side_tag} {denorm_sym(s)}\n"
+                                f"{'🟢 LONG' if sig > 0 else '🔴 SHORT'} {sym}\n"
                                 f"TF: {tf}\n"
                                 f"Entry≈ {entry:.6f}\n"
                                 f"SL: {sl:.6f}   TP: {tp:.6f}\n"
@@ -579,59 +626,47 @@ def main():
                             )
                             if send_fills:
                                 for cid in chat_ids:
-                                    try: bot.send_message(chat_id=cid, text=msg)
-                                    except Exception: pass
-                            log("ORDER", msg.replace("\n"," | "))
-
-                            last_sig[s] = sig
+                                    try:
+                                        tg_send(bot, cid, msg)
+                                    except Exception:
+                                        pass
+                            log("ORDER", msg.replace("\n", " | "))
+                            last_sig[sym] = sig
 
                 except Exception as e:
-                    es = f"{type(e).__name__}: {str(e)}"
-                    log("ERROR", f"{denorm_sym(s)} -> {es}")
-                    if send_fills:
-                        try:
-                            for cid in chat_ids:
-                                try: bot.send_message(chat_id=cid, text=f"⚠️ Runtime error {denorm_sym(s)}\n{es[:200]}")
-                                except Exception: pass
-                        except Exception:
-                            pass
-                    if '429' in es or '418' in es or 'Too many requests' in es:
-                        log("RATE", "Backoff 60s karena rate limit"); time.sleep(60)
-            # ringkas tiap siklus
+                    log("ERROR", f"{sym} -> {e}")
+
             log("TICK", f"processed={processed}/{len(symbols)}")
 
-            # heartbeat telegram
+            # Heartbeat
             if hb_minutes > 0 and datetime.now(timezone.utc) >= next_hb:
                 try:
-                    valid_ts = [t for t in last_ts.values() if t is not None]
-                    last_ts_str = (max(valid_ts).strftime("%Y-%m-%d %H:%M UTC") if valid_ts else "n/a")
-                    hb = f"⏱️ Heartbeat: processed={processed}/{len(symbols)} | last_candle={last_ts_str}"
+                    valid = [t for t in last_ts.values() if t is not None]
+                    last_candle = max(valid).strftime("%Y-%m-%d %H:%M UTC") if valid else "n/a"
+                    hb = f"⏱️ Heartbeat: processed={processed}/{len(symbols)} | last_candle={last_candle}"
                     if send_fills:
                         for cid in chat_ids:
-                            try: bot.send_message(chat_id=cid, text=hb)
-                            except Exception: pass
+                            try:
+                                tg_send(bot, cid, hb)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
                 next_hb = datetime.now(timezone.utc) + timedelta(minutes=hb_minutes)
 
             time.sleep(poll_sleep)
 
-        except KeyboardInterrupt:
-            log("STOP", "KeyboardInterrupt")
-            break
-        except Exception as e:
-            log("ERROR", f"main loop: {e}\n{traceback.format_exc()[:500]}")
-            time.sleep(5)
-
-    # shutdown ringkas
-    try:
-        if send_fills:
+    finally:
+        try:
             for cid in chat_ids:
-                try: bot.send_message(chat_id=cid, text="⏹️ LIVE Trader stopped")
-                except Exception: pass
-    except Exception:
-        pass
-    log("STOP", "Done")
+                try:
+                    tg_send(bot, cid, "⏹️ LIVE Trader (UMF) stopped")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        log("STOP", "Done")
+
 
 if __name__ == "__main__":
     main()
