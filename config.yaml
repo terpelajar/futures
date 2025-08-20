@@ -1,0 +1,135 @@
+exchange: binance
+market_type: futures
+timeframe: 15m
+lookback_candles: 1000
+
+telegram:
+  bot_token: "8304276817:AAGM4_XPZaXOeY5nyRJd1saZR8aZkyZWh38"
+  chat_ids: [927202187]
+
+account:
+  equity_usdt: 1000
+
+keys:
+  binance:
+    api_key: "wxxnKe6f45K0GylGozdpKztwooTz05DCrfDCywLGwJchOeoUUZAtHc15IpsrjUXS"      # utk live trader/testnet nanti
+    secret:  "dUcbE6jT5HL4cQJrEFFyWwFHX1o1SI36BAqEHc4gVWnHKqn3MQsuoJyI0gSvvpe3"
+
+live:
+  enabled: true
+  testnet: true                     # mulai di testnet!
+  position_mode: oneway             # oneway | hedge
+  margin_type: ISOLATED             # ISOLATED | CROSSED
+  working_type: MARK_PRICE          # trigger TP/SL pakai mark price
+  send_fills_to_telegram: true
+
+fees:
+  taker: 0.0005                     # 0.0500% (VIP0 reguler)
+  maker: 0.0002                     # 0.0200% (VIP0 reguler)
+  bnb_discount: 0.0                 # set 0.10 jika bayar fee futures pakai BNB
+  assume_order: taker               # kita asumsikan entry/exit = taker (market)
+
+# ====== RISK & LEVELS ======
+risk:
+  leverage: 3
+  risk_per_trade: 0.01              # 1% equity per trade
+  stop_mode: atr                    # atr | percent
+  take_profit_rr: 2.0
+  atr_entry_period: 14
+  atr_entry_mult: 1.5
+  atr_trail_period: 12
+  atr_trail_mult: 6.0
+  # min_sl_pct: 0.02                # (opsional) paksa SL minimal 2% (unlevered)
+
+  breakeven:
+    enabled: true
+    r_multiple: 1.0                 # geser SL saat +1R
+    fee_taker_pct: 0.0005           # samakan dgn taker kamu (0.0500%)
+    slippage_est_pct: 0.0002        # estimasi slip 0.02%/sisi (tweak sesuai real)
+    extra_buffer_pct: 0.0001        # buffer tambahan 0.01% (opsional)
+
+# ====== BOT (sinyal Telegram) ======
+bot:
+  loop_sleep: 30
+  snapshot_on_start: false
+  min_tp_pct_send: 0.01             # kirim sinyal hanya jika TP (unlev) >= 1%
+  fetch_batch: 10
+
+# ====== PAPER TRADER ======
+paper:
+  enabled: true
+  entry_on: next_open               # next_open | close
+  min_tp_pct: 0.01                  # skip trade jika TP (unlev) < 1%
+  fetch_batch: 10
+  send_fills_to_telegram: true
+  out_dir: paper_reports
+
+# ====== STRATEGI ======
+strategies: ["boll_breakout"]
+params:
+  bb_len: 20
+  bb_std: 2.0
+  bb_trend_ma: 50
+  bb_require_cmf: true
+  bb_allow_shorts: true
+  ichimoku_allow_shorts: true
+  cmf_len: 20
+  # ATR params diambil dari block risk (di atas)
+
+# Map strategi/parameter per simbol (opsional)
+strategy_per_symbol: {}
+params_overrides: {}
+
+# ====== UNIVERSE / SIMBOL ======
+universe:
+  mode: static
+  symbols:
+    - "ETH/USDT"
+    - "BTC/USDT"
+    - "SOL/USDT"
+    - "ALPACA/USDT"
+    - "DOGE/USDT"
+    - "XRP/USDT"
+    - "ADA/USDT"
+    - "XNY/USDT"
+    - "ALPINE/USDT"
+    - "ENA/USDT"
+    - "MYX/USDT"
+    - "1000PEPE/USDT"
+    - "CTSI/USDT"
+    - "SUI/USDT"
+    - "BNX/USDT"
+    - "LINK/USDT"
+    - "TRUMP/USDT"
+    - "FARTCOIN/USDT"
+    - "AVAX/USDT"
+    - "SKL/USDT"
+    - "UNI/USDT"
+    - "HYPE/USDT"
+    - "LTC/USDT"
+    - "ARB/USDT"
+    - "PENGU/USDT"
+    - "PROVE/USDT"
+    - "LA/USDT"
+    - "USELESS/USDT"
+    - "WIF/USDT"
+    - "PUMP/USDT"
+    - "AIO/USDT"
+    - "TRX/USDT"
+    - "1000BONK/USDT"
+    - "AAVE/USDT"
+    - "LDO/USDT"
+    - "XLM/USDT"
+    - "DOT/USDT"
+    - "EPIC/USDT"
+    - "BCH/USDT"
+    - "VIDT/USDT"
+    - "TIA/USDT"
+    - "AGIX/USDT"
+    - "API3/USDT"
+    - "WLD/USDT"
+    - "NEAR/USDT"
+    - "HBAR/USDT"
+    - "CRV/USDT"
+    - "1000SHIB/USDT"
+    - "OP/USDT"
